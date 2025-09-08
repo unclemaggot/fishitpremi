@@ -2789,7 +2789,7 @@ SettingsTab:Button({
 SettingsTab:Button({
 	Title = "HDR Shader",
 	Callback = function()
-		loadstring(game:HttpGet("https://paste.monster/IVE9Xt3YJWkp/raw/"))()
+		loadstring(game:HttpGet("https://raw.githubusercontent.com/unclemaggot/fishitpremi/refs/heads/main/hdr.lua"))()
 	end,
 })
 
