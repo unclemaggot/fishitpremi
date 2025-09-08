@@ -1,0 +1,416 @@
+------------------------------------------
+----- =======[ Load WindUI ]
+-------------------------------------------
+
+local Version = "1.6.45"
+local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/download/" .. Version .. "/main.lua"))()
+
+-------------------------------------------
+----- =======[ GLOBAL & CORE FUNCTIONS ]
+-------------------------------------------
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local player = Players.LocalPlayer
+
+-- Safe require helper from Rayfield version
+local function safeRequire(pathTbl)
+    local ptr = ReplicatedStorage
+    for _, seg in ipairs(pathTbl) do
+        ptr = ptr:FindFirstChild(seg)
+        if not ptr then return nil end
+    end
+    local ok, mod = pcall(require, ptr)
+    return ok and mod or nil
+end
+
+-- Initialize controllers and utilities
+local FishingController = safeRequire({"Controllers","FishingController"})
+local AnimationController = safeRequire({"Controllers","AnimationController"})
+local Replion = safeRequire({"Packages","Replion"}) or safeRequire({"Packages","replion"})
+local ItemUtility = safeRequire({"Shared","ItemUtility"})
+
+-- Net folder helper
+local function getNetFolder()
+    local packages = ReplicatedStorage:WaitForChild("Packages", 10)
+    if not packages then return nil end
+    local index = packages:FindFirstChild("_Index")
+    if index then
+        for _, child in ipairs(index:GetChildren()) do
+            if child.Name:match("^sleitnick_net@") then
+                return child:FindFirstChild("net")
+            end
+        end
+    end
+    return ReplicatedStorage:FindFirstChild("net") or ReplicatedStorage:FindFirstChild("Net")
+end
+
+-- =========================
+-- STATE MANAGEMENT
+-- =========================
+local state = {
+    AutoFish = false,
+    AutoFavourite = false,
+    AutoSell = false,
+}
+
+local allowedTiers = { [4]=true, [5]=true, [6]=true, [7]=true }
+
+-- =========================
+-- AUTO FAVOURITE
+-- =========================
+local function startAutoFavourite()
+    task.spawn(function()
+        while state.AutoFavourite do
+            pcall(function()
+                if not Replion or not ItemUtility then return end
+                local netFolder = getNetFolder()
+                local favoriteRemote = netFolder and netFolder:FindFirstChild("RE/FavoriteItem")
+                if not favoriteRemote then return end
+
+                local DataReplion = Replion.Client:WaitReplion("Data")
+                local items = DataReplion and DataReplion:Get({"Inventory","Items"})
+                if type(items) ~= "table" then return end
+                for _, item in ipairs(items) do
+                    local base = ItemUtility:GetItemData(item.Id)
+                    if base and base.Data and allowedTiers[base.Data.Tier] and not item.Favorited then
+                        favoriteRemote:FireServer(item.UUID)
+                        item.Favorited = true
+                    end
+                end
+            end)
+            task.wait(5)
+        end
+    end)
+end
+
+-- =========================
+-- AUTO SELL
+-- =========================
+local lastSellTime = 0
+local AUTO_SELL_THRESHOLD = 60
+local AUTO_SELL_DELAY = 60
+
+local function startAutoSell()
+    task.spawn(function()
+        while state.AutoSell do
+            pcall(function()
+                if not Replion then return end
+                local DataReplion = Replion.Client:WaitReplion("Data")
+                local items = DataReplion and DataReplion:Get({"Inventory","Items"})
+                if type(items) ~= "table" then return end
+
+                local unfavoritedCount = 0
+                for _, item in ipairs(items) do
+                    if not item.Favorited then
+                        unfavoritedCount += (item.Count or 1)
+                    end
+                end
+
+                if unfavoritedCount >= AUTO_SELL_THRESHOLD and os.time() - lastSellTime >= AUTO_SELL_DELAY then
+                    local netFolder = getNetFolder()
+                    if netFolder then
+                        local sellFunc = netFolder:FindFirstChild("RF/SellAllItems")
+                        if sellFunc then
+                            task.spawn(sellFunc.InvokeServer, sellFunc)
+                            lastSellTime = os.time()
+                        end
+                    end
+                end
+            end)
+            task.wait(10)
+        end
+    end)
+end
+
+-- =========================
+-- AUTO FISH
+-- =========================
+local autoFishLoop
+local function playCastAnim()
+    pcall(function()
+        if AnimationController and AnimationController.PlayAnimation then
+            AnimationController:PlayAnimation("CastFromFullChargePosition1Hand")
+        end
+    end)
+end
+
+local function startAutoFish()
+    if autoFishLoop then task.cancel(autoFishLoop) end
+    autoFishLoop = task.spawn(function()
+        local net = getNetFolder(); if not net then return end
+        local equipEvent = net:WaitForChild("RE/EquipToolFromHotbar")
+        local chargeFunc = net:WaitForChild("RF/ChargeFishingRod")
+        local startMini  = net:WaitForChild("RF/RequestFishingMinigameStarted")
+        local complete   = net:WaitForChild("RE/FishingCompleted")
+
+        while state.AutoFish do
+            if FishingController and FishingController.OnCooldown and FishingController:OnCooldown() then
+                repeat task.wait(0.2) until not FishingController:OnCooldown() or not state.AutoFish
+            end
+            if not state.AutoFish then break end
+
+            pcall(function()
+                playCastAnim()
+                equipEvent:FireServer(1)
+                task.wait(0.1)
+                chargeFunc:InvokeServer(workspace:GetServerTimeNow())
+                task.wait(0.1)
+                startMini:InvokeServer(-0.75, 1)
+                task.wait(0.2)
+                for i=1,20 do
+                    complete:FireServer()
+                    task.wait(0.05)
+                end
+            end)
+
+            local t = os.clock()
+            while os.clock() - t < 0.7 and state.AutoFish do task.wait() end
+        end
+    end)
+end
+
+local function stopAutoFish()
+    if autoFishLoop then task.cancel(autoFishLoop); autoFishLoop = nil end
+end
+
+-- =========================
+-- TELEPORT
+-- =========================
+local function teleportTo(posList)
+    local char = player.Character or player.CharacterAdded:Wait()
+    local hrp = char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart")
+
+    if hrp then
+        local chosen = typeof(posList) == "table" and posList[math.random(1,#posList)] or posList
+        hrp.CFrame = chosen
+    end
+end
+
+-------------------------------------------
+----- =======[ UI SETUP ]
+-------------------------------------------
+
+local Window = WindUI:CreateWindow({
+    Title = "e-Fishery V1",
+    Icon = "shrimp",
+    Author = "by Zee (WindUI Edition)",
+    Folder = "e-Fishery",
+    Size = UDim2.fromOffset(600, 400),
+    Transparent = true,
+    Theme = "Dark",
+    KeySystem = false,
+    ScrollBarEnabled = true,
+    HideSearchBar = true,
+})
+
+local Main = Window:Tab({ Title = "Main", Icon = "toggle-right" })
+local AutoFarm = Window:Tab({ Title = "Auto Farm", Icon = "map" })
+local FishNotif = Window:Tab({ Title = "Fish Notification", Icon = "bell-ring" })
+
+-- =========================
+-- MAIN TAB
+-- =========================
+local autoFishToggle
+autoFishToggle = Main:Toggle({
+    Title = "Auto Fish",
+    Callback = function(Value)
+        state.AutoFish = Value
+        if Value then startAutoFish() else stopAutoFish() end
+    end
+})
+
+Main:Toggle({
+    Title = "Auto Favourite (Epic+)",
+    Callback = function(Value)
+        state.AutoFavourite = Value
+        if Value then startAutoFavourite() end
+    end
+})
+
+Main:Toggle({
+    Title = "Auto Sell (Threshold)",
+    Callback = function(Value)
+        state.AutoSell = Value
+        if Value then startAutoSell() end
+    end
+})
+
+-- =========================
+-- FISH NOTIFICATION
+-- =========================
+local webhookPath
+FishNotif:Paragraph({
+    Title = "Fish Notification",
+    Color = "Green",
+    Desc = "Sends a Discord embed when you catch a rare fish. Enter webhook key below."
+})
+
+local function validateWebhook(path)
+    if not path or path == "" then return false,"Key empty" end
+    if not path:match("^%d+/.+") then return false,"Invalid format" end
+    local url = "https://discord.com/api/webhooks/" .. path
+    local ok,resp = pcall(game.HttpGet, game, url)
+    if not ok then return false,"Cannot reach Discord" end
+    local succ,data = pcall(HttpService.JSONDecode,HttpService,resp)
+    if not succ or not data.channel_id then return false,"Invalid response" end
+    return true,data.channel_id
+end
+
+FishNotif:Input({
+    Title="Webhook Key",Desc="Enter your Discord webhook key",
+    Placeholder="id/token",
+    Callback=function(text)
+        if text=="" then return end
+        webhookPath=text
+        local ok,res=validateWebhook(webhookPath)
+        if ok then
+            WindUI:Notify({Title="Key Valid",Content="Channel: "..res,Icon="circle-check"})
+        else
+            WindUI:Notify({Title="Key Invalid",Content=res,Icon="ban"})
+        end
+    end
+})
+
+local FishDataById,VariantsByName,SelectedCategories={}, {},{}
+pcall(function()
+    for _, item in ipairs(ReplicatedStorage.Items:GetChildren()) do
+        local ok,data=pcall(require,item)
+        if ok and data.Data and data.Data.Type=="Fishes" then
+            FishDataById[data.Data.Id]={Name=data.Data.Name,SellPrice=data.SellPrice or 0}
+        end
+    end
+    for _,v in ipairs(ReplicatedStorage.Variants:GetChildren()) do
+        local ok,data=pcall(require,v)
+        if ok and data.Data and data.Data.Type=="Variant" then
+            VariantsByName[data.Data.Name]=data.SellMultiplier or 1
+        end
+    end
+end)
+
+FishNotif:Dropdown({
+    Title="Select Fish Categories",
+    Desc="Choose categories to send",
+    Values={"Secret","Legendary","Mythic","Epic"},
+    Multi=true,
+    Default={"Secret"},
+    Callback=function(sel) SelectedCategories=sel end
+})
+
+local function isTargetFish(_,rarity)
+    for _,cat in pairs(SelectedCategories) do
+        if string.find(string.lower(rarity),string.lower(cat)) then return true end
+    end
+    return false
+end
+
+local function GetRobloxImage(assetId)
+    local url="https://thumbnails.roblox.com/v1/assets?assetIds="..assetId.."&size=420x420&format=Png&isCircular=false"
+    local ok,resp=pcall(game.HttpGet,game,url)
+    if ok then
+        local data=HttpService:JSONDecode(resp)
+        if data and data.data and data.data[1] and data.data[1].imageUrl then
+            return data.data[1].imageUrl
+        end
+    end
+    return nil
+end
+
+local function sendFishWebhook(fishName,rarity,assetId,itemId,variantId)
+    if not webhookPath or webhookPath=="" then
+        warn("[FishNotif] No webhook key set")
+        return
+    end
+    local WebhookURL="https://discord.com/api/webhooks/"..webhookPath
+    local imageUrl=GetRobloxImage(assetId)
+    if not imageUrl then warn("[FishNotif] No image found, sending without image") end
+
+    local caught=player:FindFirstChild("leaderstats") and player.leaderstats:FindFirstChild("Caught")
+    local rarest=player:FindFirstChild("leaderstats") and player.leaderstats:FindFirstChild("Rarest Fish")
+    local basePrice=(FishDataById[itemId] and FishDataById[itemId].SellPrice or 0)*(VariantsByName[variantId] or 1)
+
+    -- rarity colors
+    local rarityColors = {
+        Secret     = 16777215, -- white
+        Legendary  = 16766720, -- gold
+        Mythic     = 10181046, -- red
+        Epic       = 10197915, -- purple
+        Rare       = 3447003,  -- blue
+        Uncommon   = 3066993,  -- green
+        Common     = 9807270,  -- gray
+    }
+
+    -- pick based on rarity text
+    local color = 3447003
+    for key,val in pairs(rarityColors) do
+        if string.find(string.lower(rarity), string.lower(key)) then
+            color = val
+            break
+        end
+    end
+
+    local embed={
+        title="🎣 Fish Caught!",
+        description=string.format("**%s** caught a **%s** (%s)",player.DisplayName,fishName,rarity),
+        color=color,
+        fields={
+            {name="Sell Price",value=tostring(basePrice),inline=true},
+            {name="Total Caught",value=tostring(caught and caught.Value or "N/A"),inline=true},
+            {name="Rarest Fish",value=tostring(rarest and rarest.Value or "N/A"),inline=true},
+        },
+        footer={text="e-Fishery Notifier | "..os.date("%H:%M:%S")}
+    }
+    if imageUrl then embed.image={url=imageUrl} end
+
+    local data={username="e-Fishery",embeds={embed}}
+
+    local requestFunc=syn and syn.request or http and http.request or http_request or request or fluxus and fluxus.request
+    if not requestFunc then
+        warn("[FishNotif] No request function found")
+        return
+    end
+
+    local ok,err=pcall(function()
+        requestFunc({
+            Url=WebhookURL,
+            Method="POST",
+            Headers={["Content-Type"]="application/json"},
+            Body=HttpService:JSONEncode(data)
+        })
+    end)
+    if not ok then
+        warn("[FishNotif] Failed to send webhook:",err)
+    else
+        print("[FishNotif] Webhook sent:",fishName)
+    end
+end
+
+local LastCatchData={}
+local REObtained=getNetFolder() and getNetFolder():FindFirstChild("RE/ObtainedNewFishNotification")
+if REObtained then
+    REObtained.OnClientEvent:Connect(function(itemId,_,data)
+        if data and data.InventoryItem and data.InventoryItem.Metadata then
+            LastCatchData.ItemId=itemId
+            LastCatchData.VariantId=data.InventoryItem.Metadata.VariantId
+        end
+    end)
+end
+
+pcall(function()
+    local guiNotif=player.PlayerGui:WaitForChild("Small Notification"):WaitForChild("Display"):WaitForChild("Container")
+    local fishText=guiNotif:WaitForChild("ItemName")
+    local rarityText=guiNotif:WaitForChild("Rarity")
+    local imageFrame=player.PlayerGui["Small Notification"].Display.VectorFrame.Vector
+
+    fishText:GetPropertyChangedSignal("Text"):Connect(function()
+        task.wait(0.1)
+        local fishName,rarity=fishText.Text,rarityText.Text
+        if isTargetFish(fishName,rarity) then
+            local assetId=string.match(imageFrame.Image,"%d+")
+            if assetId then
+                sendFishWebhook(fishName,rarity,assetId,LastCatchData.ItemId,LastCatchData.VariantId)
+            end
+        end
+    end)
+end)
